@@ -1,7 +1,15 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index efbca17..c74eb20 100644
+index efbca17..cc10ec5 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
+@@ -34,6 +34,7 @@ endif()
+ set(CMAKE_INCLUDE_CURRENT_DIR ON)
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ set(SOFTWARE_VER "8.0.0")
++set(MXL_RV_VER "2.0")
+
+ INCLUDE (CheckIncludeFiles)
+ INCLUDE (CheckFunctionExists)
 @@ -78,6 +79,7 @@ OPTION(HAVE_SENDMMSG "Enable/Disable use of SendMMsg()" ON)
  OPTION(HAVE_RECVMMSG "Enable/Disable use of RecvMMsg()" ON)
  OPTION(HAVE_GSO "Enable/Disable use of Generic Segmentation Offload (GSO)" ON)
@@ -10,8 +18,16 @@ index efbca17..c74eb20 100644
 
  add_definitions(-DSYSCONFDIR=\"${CMAKE_INSTALL_PREFIX}/etc\")
  add_definitions(-DLOCALSTATEDIR=\"${CMAKE_INSTALL_PREFIX}/var/lib\")
+@@ -98,3 +100,7 @@ target_link_libraries(udpst ${libraries} m)
+ if (CMAKE_GENERATOR MATCHES "Ninja")
+     set(CMAKE_PLATFORM_HAS_INSTALLNAME 1)
+ endif()
++
++INSTALL(TARGETS udpst
++   RUNTIME DESTINATION /usr/bin
++)
 diff --git a/config.h.cmake b/config.h.cmake
-index 8b42b67..9e271b3 100644
+index 8b42b67..09ba6aa 100644
 --- a/config.h.cmake
 +++ b/config.h.cmake
 @@ -2,6 +2,7 @@
@@ -27,16 +43,17 @@ index 8b42b67..9e271b3 100644
  #cmakedefine DISABLE_INT_TIMER
  #cmakedefine RATE_LIMITING
 +#cmakedefine MXL_OPT
-
+ 
  #endif /* CONFIG_H */
 diff --git a/udpst.c b/udpst.c
-index 1980456..8e84336 100644
+index 1980456..d01e176 100644
 --- a/udpst.c
 +++ b/udpst.c
-@@ -105,6 +105,13 @@
+@@ -104,7 +104,13 @@
+ #ifndef __linux__
  #include "../udpst_alt2.h"
  #endif
-
+-
 +#if defined(MXL_OPT)
 +#include <netinet/if_ether.h>
 +#include <netinet/ip.h>
@@ -47,7 +64,7 @@ index 1980456..8e84336 100644
  //----------------------------------------------------------------------------
  //
  // Internal function prototypes
-@@ -236,11 +243,35 @@ int main(int argc, char **argv) {
+@@ -236,11 +242,35 @@ int main(int argc, char **argv) {
          // Print banner or initialize JSON output object
          //
          if (!conf.jsonOutput) {
@@ -83,7 +100,7 @@ index 1980456..8e84336 100644
                  var += sprintf(&scratch[var], ", Built: " __DATE__ " " __TIME__);
  #ifdef RATE_LIMITING
                  var += sprintf(&scratch[var], ", Rate Limiting via '-B mbps'");
-@@ -271,11 +302,11 @@ int main(int argc, char **argv) {
+@@ -271,11 +301,11 @@ int main(int argc, char **argv) {
                  var += sprintf(&scratch[var], ", Optimizations:");
  #ifdef HAVE_SENDMMSG
                  var += sprintf(&scratch[var], " SendMMsg()");
@@ -97,7 +114,22 @@ index 1980456..8e84336 100644
                  var += sprintf(&scratch[var], " RecvMMsg()+Trunc");
  #endif // HAVE_RECVMMSG
                  scratch[var++] = '\n';
-@@ -763,7 +794,11 @@ void signal_exit(int signal) {
+@@ -299,7 +329,14 @@ int main(int argc, char **argv) {
+         // Allocate and initialize buffers
+         //
+         repo.sendingRates = calloc(1, MAX_SENDING_RATES * sizeof(struct sendingRate));
++#ifdef MXL_OPT
++        if (conf.gsoStatus)
++            repo.sndBuffer    = calloc(1, GSO_SND_BUFFER_SIZE);
++        else
++            repo.sndBuffer    = calloc(1, SND_BUFFER_SIZE);
++#else
+         repo.sndBuffer    = calloc(1, SND_BUFFER_SIZE);
++#endif
+         repo.defBuffer    = calloc(1, RCV_BUFFER_SIZE);
+         repo.randData     = malloc(MAX_JPAYLOAD_SIZE);
+         repo.sndBufRand   = malloc(SND_BUFFER_SIZE);
+@@ -763,7 +800,11 @@ void signal_exit(int signal) {
  //
  int proc_parameters(int argc, char **argv, int fd) {
          int i, j, var, value;
@@ -109,7 +141,7 @@ index 1980456..8e84336 100644
 
          //
          // Clear configuration and global repository data
-@@ -777,6 +812,9 @@ int proc_parameters(int argc, char **argv, int fd) {
+@@ -777,6 +818,9 @@ int proc_parameters(int argc, char **argv, int fd) {
          value            = opterr;
          opterr           = 0;
          conf.controlPort = DEF_CONTROL_PORT;
@@ -119,9 +151,13 @@ index 1980456..8e84336 100644
          while ((i = getopt(argc, argv, optstring)) != -1) {
                  switch (i) {
                  case 'u':
-@@ -923,6 +961,15 @@ int proc_parameters(int argc, char **argv, int fd) {
+@@ -922,7 +966,19 @@ int proc_parameters(int argc, char **argv, int fd) {
+                 case '6':
                          conf.addrFamily = AF_INET6;
                          conf.ipv6Only   = TRUE;
++#if defined(MXL_OPT)
++                        conf.mtuSize = (ETH_DATA_LEN - (sizeof(struct ip6_hdr) + sizeof(struct udphdr)));
++#endif
                          break;
 +#if defined(MXL_OPT)
 +                case 'z':
@@ -135,7 +171,7 @@ index 1980456..8e84336 100644
                  case 'C':
                          if (repo.isServer) {
                                  var = sprintf(scratch, "ERROR: Multi-connection count only set by client\n");
-@@ -1011,6 +1058,11 @@ int proc_parameters(int argc, char **argv, int fd) {
+@@ -1011,6 +1067,11 @@ int proc_parameters(int argc, char **argv, int fd) {
                  case 'X':
                          conf.randPayload = TRUE;
                          break;
@@ -147,7 +183,7 @@ index 1980456..8e84336 100644
                  case 'S':
                          conf.showSendingRates = TRUE;
                          break;
-@@ -1069,6 +1121,14 @@ int proc_parameters(int argc, char **argv, int fd) {
+@@ -1069,6 +1130,14 @@ int proc_parameters(int argc, char **argv, int fd) {
                          return -1;
  #endif
                          break;
@@ -162,7 +198,7 @@ index 1980456..8e84336 100644
                  case 'm':
                          // Server will use as configured maximum
                          value = (int) strtol(optarg, NULL, 0); // Allow hex values (0x00-0xff)
-@@ -1270,6 +1330,11 @@ int proc_parameters(int argc, char **argv, int fd) {
+@@ -1270,6 +1339,11 @@ int proc_parameters(int argc, char **argv, int fd) {
                                        "       -6           Use only IPv6 address family (AF_INET6)\n"
                                        "(c)    -C cnt[-max] Multi-connection count [Default %d per server]\n"
                                        "(s)    -x           Execute server as background (daemon) process\n"
@@ -174,7 +210,7 @@ index 1980456..8e84336 100644
                                        "(s)    -1           Server exits after one test execution\n"
                                        "(e)    -e           Disable suppression of socket (send/receive) errors\n"
                                        "       -v           Enable verbose output messaging\n"
-@@ -1288,6 +1353,9 @@ int proc_parameters(int argc, char **argv, int fd) {
+@@ -1288,6 +1362,9 @@ int proc_parameters(int argc, char **argv, int fd) {
                                        "       -i count     Display bimodal maxima (specify initial sub-intervals)\n"
                                        "(c)    -o           Use One-Way Delay instead of RTT for delay variation\n"
                                        "(c)    -R           Include Out-of-Order/Duplicate datagrams\n"
@@ -184,10 +220,10 @@ index 1980456..8e84336 100644
                                        "       -a key       Authentication key (%d characters max)\n"
                                        "(m,v)  -m value     Packet marking octet (IP_TOS/IPV6_TCLASS) [Default %d]\n"
                                        "(m,i)  -I [%c]index  Index of sending rate (see '-S') [Default %c0 = <Auto>]\n"
-@@ -1334,6 +1402,15 @@ int proc_parameters(int argc, char **argv, int fd) {
+@@ -1334,6 +1411,15 @@ int proc_parameters(int argc, char **argv, int fd) {
                  }
          }
- 
+
 +#if defined(MXL_OPT)
 +        //
 +        // Set the MTU Size for the transmission
@@ -201,7 +237,7 @@ index 1980456..8e84336 100644
          // Validate remaining parameters
          //
 diff --git a/udpst.h b/udpst.h
-index 8d87733..203473f 100644
+index 8d87733..0bbb170 100644
 --- a/udpst.h
 +++ b/udpst.h
 @@ -142,7 +142,11 @@
@@ -216,17 +252,20 @@ index 8d87733..203473f 100644
  #define BASE_SEND_TIMER1  MIN_INTERVAL_USEC // Base send timer, transmitter 1 (us)
  #define BASE_SEND_TIMER2  1000              // Base send timer, transmitter 2 (us)
  #define MAX_L3_PACKET     1250              // Max desired L3 packet size
-@@ -157,6 +161,9 @@
+@@ -157,6 +161,12 @@
  #define MAX_PAYLOAD_SIZE  (MAX_L3_PACKET - L3DG_OVERHEAD)
  #define MAX_JPAYLOAD_SIZE (MAX_JL3_PACKET - L3DG_OVERHEAD)
  #define MAX_TPAYLOAD_SIZE (MAX_TL3_PACKET - L3DG_OVERHEAD)
 +#if defined(MXL_OPT)
 +#define GSO_PAYLOAD_SIZE1  12465
++#define GSO_MAX_PAYLOAD_SIZE 65536       //64KB
++#define MAX_GSO_BURST_SIZE   2
++#define GSO_SND_BUFFER_SIZE (MAX_GSO_BURST_SIZE * GSO_MAX_PAYLOAD_SIZE)
 +#endif
  //
  // Send buffer needs to contain all datagram payloads when not using GSO (or all segment buffers with GSO)
  //
-@@ -224,6 +231,11 @@ struct configuration {
+@@ -224,6 +234,11 @@ struct configuration {
          BOOL jumboStatus;                // Enable/disable jumbo datagram sizes
          BOOL traditionalMTU;             // Traditional (1500 byte) MTU
          BOOL debug;                      // Enable debug messaging
@@ -238,7 +277,7 @@ index 8d87733..203473f 100644
          BOOL randPayload;                // Payload randomization
          int rateAdjAlgo;                 // Rate adjustment algorithm
          BOOL showSendingRates;           // Display sending rate table parameters
-@@ -250,6 +262,9 @@ struct configuration {
+@@ -250,6 +265,9 @@ struct configuration {
          BOOL intfForMax;                 // Local interface used for maximum
          char intfName[IFNAMSIZ + 1];     // Local interface for supplemental stats
          int logFileMax;                  // Maximum log file size
@@ -249,13 +288,13 @@ index 8d87733..203473f 100644
  };
  //----------------------------------------------------------------------------
 diff --git a/udpst_control.c b/udpst_control.c
-index 3610a64..5cb3be5 100644
+index 3610a64..f53ea03 100644
 --- a/udpst_control.c
 +++ b/udpst_control.c
 @@ -96,6 +96,16 @@
  #include "../udpst_control_alt2.h"
  #endif
- 
+
 +#if defined(MXL_OPT)
 +#include <stdbool.h>
 +#include <netinet/udp.h>
@@ -272,7 +311,7 @@ index 3610a64..5cb3be5 100644
 @@ -120,6 +130,11 @@ extern char *rateAdjAlgo[];
  //
  extern cJSON *json_top, *json_output;
- 
+
 +#if defined(MXL_OPT)
 +#ifndef UDP_GRO
 +#define UDP_GRO 104
@@ -290,7 +329,25 @@ index 3610a64..5cb3be5 100644
                          c->secAction = &service_recvmmsg;
  #else
                          c->secAction = &service_loadpdu;
-@@ -1124,7 +1139,7 @@ int service_actresp(int connindex) {
+@@ -1000,7 +1015,16 @@ int service_actreq(int connindex) {
+         tspecvar.tv_nsec = NSECINSEC / 2;
+         tspecplus(&repo.systemClock, &tspecvar, &c->timer3Thresh);
+         c->timer3Action = &stop_test;
+-
++#if defined(MXL_OPT)
++       if (conf.groStatus) {
++            int val2 = 1;
++            if(setsockopt(c->fd, IPPROTO_UDP, UDP_GRO, &val2, sizeof(val2)) < 0) {
++                var = sprintf(scratch, "SET OB_UDPST ERROR: %s\n", strerror(errno));
++                send_proc(errConn, scratch, var);
++                return -1;
++            }
++        }
++#endif
+         return 0;
+ }
+ //----------------------------------------------------------------------------
+@@ -1124,7 +1148,7 @@ int service_actresp(int connindex) {
                  testtype      = DSTEST_TEXT;
                  c->rttMinimum = INITIAL_MIN_DELAY;
                  c->rttSample  = INITIAL_MIN_DELAY;
@@ -299,14 +356,23 @@ index 3610a64..5cb3be5 100644
                  c->secAction = &service_recvmmsg;
  #else
                  c->secAction = &service_loadpdu;
-@@ -1574,6 +1589,17 @@ int new_conn(int activefd, char *host, int port, int type, int (*priaction)(int)
+@@ -1574,6 +1598,26 @@ int new_conn(int activefd, char *host, int port, int type, int (*priaction)(int)
                                  init_conn(i, TRUE);
                                  return -1;
                          }
 +#if defined(MXL_OPT)
 +                        if (conf.gsoStatus) {
-+                                int val1 = IP_PMTUDISC_DO;
-+                                if(setsockopt(fd, SOL_IP, IP_MTU_DISCOVER, &val1, sizeof(val1)) < 0) {
++                                int level, dtype, val;
++                                if (conf.addrFamily == AF_INET) {
++                                    level = SOL_IP;
++                                    dtype = IP_MTU_DISCOVER;
++                                    val = IP_PMTUDISC_DO;
++                                } else {
++                                    level = SOL_IPV6;
++                                    dtype = IPV6_MTU_DISCOVER;
++                                    val = IPV6_PMTUDISC_DO;
++                            }
++                            if(setsockopt(fd, level, dtype, &val, sizeof(val)) < 0) {
 +                                    var = sprintf(scratch, "[%d]SET IP_MTU_DISCOVER ERROR: %s\n", i, strerror(errno));
 +                                    send_proc(errConn, scratch, var);
 +                                    init_conn(i, TRUE);
@@ -317,7 +383,7 @@ index 3610a64..5cb3be5 100644
                  }
                  //
                  // Get buffer values
-@@ -1649,6 +1675,53 @@ int sock_connect(int connindex) {
+@@ -1649,6 +1693,53 @@ int sock_connect(int connindex) {
          //
          return connected(connindex);
  }
@@ -371,8 +437,19 @@ index 3610a64..5cb3be5 100644
  //----------------------------------------------------------------------------
  //
  // Socket connect completion handler
-@@ -1705,6 +1778,10 @@ int connected(int connindex) {
+@@ -1702,9 +1793,21 @@ int connected(int connindex) {
+         }
+         if (var != 3) {
+                 c->ipProtocol = IPPROTO_IPV6;
++#if defined(MXL_OPT)
++                conf.addrFamily = AF_INET6;
++                conf.mtuSize = (conf.mtuSize - sizeof(struct ip6_hdr));
++#endif
          } else {
++#if defined(MXL_OPT)
++                conf.addrFamily = AF_INET;
++                conf.mtuSize = (conf.mtuSize - sizeof(struct iphdr));
++#endif
                  c->ipProtocol = IPPROTO_IP;
          }
 +#if defined(MXL_OPT)
@@ -383,7 +460,7 @@ index 3610a64..5cb3be5 100644
  }
  //----------------------------------------------------------------------------
 diff --git a/udpst_data.c b/udpst_data.c
-index dddf421..53af8e7 100644
+index dddf421..8ecea54 100644
 --- a/udpst_data.c
 +++ b/udpst_data.c
 @@ -91,6 +91,7 @@
@@ -403,13 +480,13 @@ index dddf421..53af8e7 100644
 +#define UDP_SEGMENT    103
 +#endif
 +#endif
- 
+
  //----------------------------------------------------------------------------
  // Function definitions
-@@ -219,8 +225,42 @@ static void _randomize_payload(char *buffer, unsigned int length) {
+@@ -219,8 +225,75 @@ static void _randomize_payload(char *buffer, unsigned int length) {
          }
  }
- 
+
 +#if defined(MXL_OPT)
 +static void send_udp_segment_cmsg(struct cmsghdr *cm)
 +{
@@ -442,6 +519,39 @@ index dddf421..53af8e7 100644
 +        return cctl;
 +
 +}
++
++//
++// Prepare lHdr for each gso sized UDP segment from
++// the large payload per burst
++//
++static void prepareSegmentlHdrs (int connindex, int lPayloadLen, char *lPayload, unsigned int rttrd)
++{
++
++        struct loadHdr *lHdr;
++        int udpPayloadRem = lPayloadLen;
++        char *nextSeg = lPayload;
++        struct connection *c = &conn[connindex];
++
++        /* skip remaining buffer if len < loadHdr */
++        while (udpPayloadRem >= sizeof(struct loadHdr)) {
++                // Prepare lHdr for UDP segment at correct offset
++                lHdr = (struct loadHdr *) nextSeg;
++                _populate_header(lHdr, c, rttrd);
++                lHdr->lpduSeqNo = htonl((uint32_t) ++c->lpduSeqNo);
++
++                if (udpPayloadRem < conf.mtuSize) {
++                        // Last short segment
++                        lHdr->udpPayload = (uint16_t) udpPayloadRem;
++                }
++                else {
++                        lHdr->udpPayload = (uint16_t) conf.mtuSize;
++                }
++
++                nextSeg += lHdr->udpPayload;
++                udpPayloadRem -= lHdr->udpPayload;
++                lHdr->udpPayload = htons(lHdr->udpPayload);
++        }
++}
 +#endif
 +
  #if defined(HAVE_SENDMMSG)
@@ -450,20 +560,23 @@ index dddf421..53af8e7 100644
  //
  // Send a burst of messages using GSO (Generic Segmentation Offload)
  //
-@@ -233,7 +273,6 @@ static void _sendmmsg_gso(int connindex, int totalburst, int burstsize, unsigned
-         struct mmsghdr mmsg[MMSG_SEGMENTS];
-         struct iovec iov[MMSG_SEGMENTS];
-         struct timespec tspecvar;
--
+@@ -245,6 +318,7 @@ static void _sendmmsg_gso(int connindex, int totalburst, int burstsize, unsigned
          //
-         // Calculate RTT response delay
+         // Prepare send structures
          //
-@@ -366,6 +405,14 @@ static void _sendmmsg_burst(int connindex, int totalburst, int burstsize, unsign
++
+         memset(mmsg, 0, sizeof(mmsg));
+         if (c->randPayload) {
+                 sndbuf = repo.sndBufRand;
+@@ -366,6 +440,17 @@ static void _sendmmsg_burst(int connindex, int totalburst, int burstsize, unsign
          //
          // Prepare send structures
          //
 +#if defined(MXL_OPT)
 +        CMSG_CTL cctl;
++        //
++        // Setup cmsg structure if GSO is enabled
++        //
 +
 +        if (conf.gsoStatus) {
 +            cctl = initializeGSO();
@@ -473,30 +586,78 @@ index dddf421..53af8e7 100644
          memset(mmsg, 0, totalburst * sizeof(struct mmsghdr));
          if (c->randPayload) {
                  nextsndbuf = repo.sndBufRand;
-@@ -392,6 +439,16 @@ static void _sendmmsg_burst(int connindex, int totalburst, int burstsize, unsign
+@@ -374,16 +459,29 @@ static void _sendmmsg_burst(int connindex, int totalburst, int burstsize, unsign
+         }
+         for (i = 0; i < totalburst; i++) {
+                 struct loadHdr *lHdr = (struct loadHdr *) nextsndbuf;
+-                _populate_header(lHdr, c, rttrd);
+-                lHdr->lpduSeqNo = htonl((uint32_t) ++c->lpduSeqNo);
+                 if (i < burstsize)
+                         uvar = payload;
+                 else
+                         uvar = addon;
++#if defined(MXL_OPT)
++                if (conf.gsoStatus) {
++                        prepareSegmentlHdrs (connindex, uvar, nextsndbuf, rttrd);
++                } else {
++                        _populate_header(lHdr, c, rttrd);
++                        lHdr->lpduSeqNo = htonl((uint32_t) ++c->lpduSeqNo);
++                        lHdr->udpPayload = htons((uint16_t) uvar);
++                        if (c->randPayload) {
++                                _randomize_payload((char *) lHdr + sizeof(struct loadHdr), uvar - sizeof(struct loadHdr));
++                        }
++                }
++#else
++                _populate_header(lHdr, c, rttrd);
++                lHdr->lpduSeqNo = htonl((uint32_t) ++c->lpduSeqNo);
+                 lHdr->udpPayload = htons((uint16_t) uvar);
+                 if (c->randPayload) {
+                         _randomize_payload((char *) lHdr + sizeof(struct loadHdr), uvar - sizeof(struct loadHdr));
+                 }
++#endif
+
+                 //
+                 // Setup corresponding message structure
+@@ -392,6 +490,20 @@ static void _sendmmsg_burst(int connindex, int totalburst, int burstsize, unsign
                  iov[i].iov_len             = (size_t) uvar;
                  mmsg[i].msg_hdr.msg_iov    = &iov[i];
                  mmsg[i].msg_hdr.msg_iovlen = 1;
 +#if defined(MXL_OPT)
 +                if (conf.gsoStatus) {
-+                    mmsg[i].msg_hdr.msg_name   = (void *)&(repo.remSas);
-+                    mmsg[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_in);
-+                    if (cctl.msg_controllen) {
-+                        mmsg[i].msg_hdr.msg_control = cctl.control;
-+                        mmsg[i].msg_hdr.msg_controllen = cctl.msg_controllen;
-+                    }
++                        mmsg[i].msg_hdr.msg_name   = (void *)&(repo.remSas);
++                        if (conf.addrFamily == AF_INET6)
++                                mmsg[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_in6);
++                        else
++                                mmsg[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_in);
++
++                        if (cctl.msg_controllen) {
++                                mmsg[i].msg_hdr.msg_control = cctl.control;
++                                mmsg[i].msg_hdr.msg_controllen = cctl.msg_controllen;
++                        }
 +                }
 +#endif
                  nextsndbuf += payload;
          }
- 
-@@ -443,7 +500,13 @@ static void _sendmsg_burst(int connindex, int totalburst, int burstsize, unsigne
+
+@@ -425,7 +537,7 @@ static void _sendmmsg_burst(int connindex, int totalburst, int burstsize, unsign
+ //
+ static void _sendmsg_burst(int connindex, int totalburst, int burstsize, unsigned int payload, unsigned int addon) {
+         register struct connection *c = &conn[connindex];
+-        struct msghdr msg;
++        struct msghdr msg = {0};
+         struct iovec iov;
+         unsigned int uvar, rttrd = 0;
+         int i;
+@@ -443,7 +555,16 @@ static void _sendmsg_burst(int connindex, int totalburst, int burstsize, unsigne
          //
          // Prepare send structures
          //
 -        memset((void *) &msg, 0, sizeof(struct msghdr));
 +#if defined(MXL_OPT)
 +        CMSG_CTL cctl;
++        //
++        // Setup cmsg structure if GSO is enabled
++        //
 +        if (conf.gsoStatus) {
 +            cctl = initializeGSO();
 +        }
@@ -505,24 +666,24 @@ index dddf421..53af8e7 100644
          if (c->randPayload) {
                  lHdr = (struct loadHdr *) repo.sndBufRand;
          } else {
-@@ -470,7 +533,12 @@ static void _sendmsg_burst(int connindex, int totalburst, int burstsize, unsigne
+@@ -470,6 +591,12 @@ static void _sendmsg_burst(int connindex, int totalburst, int burstsize, unsigne
                  iov.iov_len    = (size_t) uvar;
                  msg.msg_iov    = &iov;
                  msg.msg_iovlen = 1;
--
 +#if defined(MXL_OPT)
 +                if (conf.gsoStatus && cctl.msg_controllen) {
 +                    msg.msg_control = cctl.control;
 +                    msg.msg_controllen = cctl.msg_controllen;
 +                }
 +#endif
+
                  //
                  // Send a single message of our burst with a system call
-                 //
-@@ -653,16 +721,20 @@ int send_loadpdu(int connindex, int transmitter) {
+@@ -652,16 +779,20 @@ int send_loadpdu(int connindex, int transmitter) {
+         totalburst = burstsize;
          if (addon > 0)
                  totalburst++;
- 
+-
 +#if defined(MXL_OPT)
 +        if(conf.sendmmsgFlag)
 +                _sendmmsg_burst(connindex, totalburst, burstsize, payload, addon);
@@ -538,16 +699,118 @@ index dddf421..53af8e7 100644
 -#else
 -        _sendmsg_burst(connindex, totalburst, burstsize, payload, addon);
  #endif // HAVE_SENDMMSG
--
 +#endif // MXL_OPT
+ 
+         return 0;
+ }
+@@ -672,11 +803,26 @@ int send_loadpdu(int connindex, int transmitter) {
+ int service_loadpdu(int connindex) {
+         register struct connection *c = &conn[connindex];
+         int i, delta, var;
++#if defined(MXL_OPT)
++        int ivar;
++#endif
+         BOOL bvar, firstpdu = FALSE;
+         unsigned int uvar, seqno, rttrd;
++#if defined(MXL_OPT)
++        struct loadHdr *lHdr = (struct loadHdr *) repo.defBuffer;
++        int udpPayloadRem = repo.rcvDataSize;
++        char *nextSeg = repo.defBuffer;
++        int udpSegLen;
++
++#else
+         struct loadHdr *lHdr = (struct loadHdr *) repo.rcvDataPtr;
++#endif
+         struct timespec tspecvar, tspecdelta;
+
++#if defined(MXL_OPT)
++lbl_nextlhdr_gro:
++#endif
++
+         //
+         // Verify PDU
+         //
+@@ -812,7 +958,11 @@ int service_loadpdu(int connindex) {
+                 c->lpduHistIdx                 = ++c->lpduHistIdx & LPDU_HISTORY_MASK; // Update history buffer index
+         }
+         if (var > 0) {
+-                return 0; // No further processing for non-increasing sequence numbers
++#if defined(MXL_OPT)
++            goto next_hdr_check;
++#else
++            return 0; // No further processing for non-increasing sequence numbers
++#endif //MXL_OPT
+         }
+
+         //
+@@ -888,6 +1038,18 @@ int service_loadpdu(int connindex) {
+                 c->sisAct.delayVarSum += (uint32_t) uvar;
+                 c->sisAct.delayVarCnt++;
+         }
++#if defined(MXL_OPT)
++next_hdr_check:
++        udpSegLen = (unsigned int) ntohs(lHdr->udpPayload);
++        if (udpSegLen < udpPayloadRem) {
++            // We have received UDP_GRO segment with multiple lHdr,
++            // so iterate to next lHdr.
++            nextSeg += udpSegLen;
++            lHdr = (struct loadHdr *) nextSeg;
++            udpPayloadRem -= udpSegLen;
++            goto lbl_nextlhdr_gro;
++        }
++#endif
          return 0;
  }
  //----------------------------------------------------------------------------
+@@ -2144,11 +2306,24 @@ int recv_proc(int connindex) {
+         //
+         // Specify receive buffer size (truncate load PDUs to reduce overhead of memory copy)
+         //
++#if defined(MXL_OPT)
++        if (c->secAction == &service_recvmmsg) {
++                recvsize = RCV_HEADER_SIZE;
++        } else if (c->secAction == &service_loadpdu) {
++                // Note: The server does not know if the client is a GSO
++                // payload with multiple load PDU headers. The whole payload needs
++                // to be received.
++                recvsize = DEF_BUFFER_SIZE;
++        } else {
++                recvsize = DEF_BUFFER_SIZE;
++        }
++#else
+         if (c->secAction == &service_recvmmsg || c->secAction == &service_loadpdu) {
+                 recvsize = RCV_HEADER_SIZE;
+         } else {
+                 recvsize = DEF_BUFFER_SIZE;
+         }
++#endif
+         repo.rcvDataPtr = repo.defBuffer; // Default to start of general I/O buffer
+
+         //
+@@ -2173,7 +2348,7 @@ int recv_proc(int connindex) {
+                                 rcvbuf += recvsize;  // Next buffer
+                                 mmsgDataSize[i] = 0; // Initialize as empty
+                         }
+-#ifdef HAVE_RECVMMSG
++#if defined(HAVE_RECVMMSG) && !defined(MXL_OPT)
+                         //
+                         // Perform read and process messages
+                         //
 diff --git a/udpst_srates.c b/udpst_srates.c
-index 01b26ef..7d397e3 100644
+index 01b26ef..20827e4 100644
 --- a/udpst_srates.c
 +++ b/udpst_srates.c
-@@ -191,6 +191,33 @@ int def_sending_rates(void) {
+@@ -98,6 +98,9 @@ int def_sending_rates(void) {
+         unsigned int payload;
+         BOOL stop;
+         struct sendingRate *sr;
++#ifdef MXL_OPT
++        uint32_t udpGsoPayload1; // UDP payload (bytes)
++#endif
+
+         //
+         // Define initial sending rates up to 1 Gbps
+@@ -191,6 +194,36 @@ int def_sending_rates(void) {
                  jmax    = 11;
                  payload = MAX_PAYLOAD_SIZE;
          }
@@ -567,12 +830,15 @@ index 01b26ef..7d397e3 100644
 +        }
 +        /* MXL sending rated */
 +        for (i = -1; i < 16; i++) {
-+                sr              = &repo.sendingRates[repo.maxSendingRates++];
-+                sr->txInterval1 = BASE_SEND_TIMER1;
-+                sr->udpPayload1 = (GSO_PAYLOAD_SIZE1*(1.25+(0.25*i)))+((i*10)+10);
-+                sr->burstSize1  = 1;
++            udpGsoPayload1 = (GSO_PAYLOAD_SIZE1*(1.25+(0.25*i)))+((i*10)+10);
++            if (udpGsoPayload1 >= GSO_MAX_PAYLOAD_SIZE)
++                break;
++            sr              = &repo.sendingRates[repo.maxSendingRates++];
++            sr->txInterval1 = BASE_SEND_TIMER1;
++            sr->udpPayload1 = udpGsoPayload1;
++            sr->burstSize1  = 1;
 +        }
-+        i = 15;
++        i -= 1;
 +        sr              = &repo.sendingRates[repo.maxSendingRates++];
 +        sr->txInterval1 = BASE_SEND_TIMER1;
 +        sr->udpPayload1 = (GSO_PAYLOAD_SIZE1*(1.25+(0.25*i)))+((i*10)+10);
@@ -581,19 +847,18 @@ index 01b26ef..7d397e3 100644
          for (j = jmax; repo.maxSendingRates < MAX_SENDING_RATES; j++) {
                  sr              = &repo.sendingRates[repo.maxSendingRates++];
                  sr->txInterval1 = BASE_SEND_TIMER1;
-@@ -204,6 +231,7 @@ int def_sending_rates(void) {
+@@ -204,6 +237,7 @@ int def_sending_rates(void) {
                  sr->burstSize2  = 0;
                  sr->udpAddon2   = 0;
          }
 +#endif
- 
+
          //
          // Sanity check table
-@@ -248,7 +276,15 @@ void show_sending_rates(int fd) {
+@@ -248,6 +282,15 @@ void show_sending_rates(int fd) {
          for (i = 0, sr = repo.sendingRates; i < repo.maxSendingRates; i++, sr++) {
                  dvar = 0;
                  bvar = FALSE; // Is randomization in use
--                //
 +#ifdef MXL_OPT
 +                if (i == 1155) {
 +                    var = sprintf(scratch, "\n--------------------------- MXL Sending Rate(GSO) ---------------------------\n");
@@ -602,7 +867,7 @@ index 01b26ef..7d397e3 100644
 +                    var = write(fd, scratch,var);
 +               }
 +#endif
-+                //
++
+                 //
                  // Process all three send options
                  //
-                 for (j = 0; j < 3; j++) {

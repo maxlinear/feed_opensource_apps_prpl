@@ -1,0 +1,46 @@
+diff --git a/udpst_control.c b/udpst_control.c
+index 6be27ad..10c1ffe 100644
+--- a/udpst_control.c
++++ b/udpst_control.c
+@@ -134,6 +134,12 @@ extern cJSON *json_top, *json_output;
+ #ifndef UDP_GRO
+ #define UDP_GRO 104
+ #endif
++#ifndef OB_UDPST
++#define OB_UDPST 105
++#endif
++#ifndef OB_UDPST6
++#define OB_UDPST6 106
++#endif
+ #endif
+ //----------------------------------------------------------------------------
+ //
+@@ -1016,9 +1022,13 @@ int service_actreq(int connindex) {
+         tspecplus(&repo.systemClock, &tspecvar, &c->timer3Thresh);
+         c->timer3Action = &stop_test;
+ #if defined(MXL_OPT)
+-       if (conf.groStatus) {
++        if (conf.groStatus) {
+             int val2 = 1;
+-            if(setsockopt(c->fd, IPPROTO_UDP, UDP_GRO, &val2, sizeof(val2)) < 0) {
++            int opt_name = OB_UDPST;
++            if (c->ipProtocol == IPPROTO_IPV6)
++                opt_name = OB_UDPST6;
++
++            if(setsockopt(c->fd, IPPROTO_UDP, opt_name, &val2, sizeof(val2)) < 0) {
+                 var = sprintf(scratch, "SET OB_UDPST ERROR: %s\n", strerror(errno));
+                 send_proc(errConn, scratch, var);
+                 return -1;
+diff --git a/udpst_data.c b/udpst_data.c
+index 8fa776d..9e3b596 100644
+--- a/udpst_data.c
++++ b/udpst_data.c
+@@ -1040,7 +1040,7 @@ lbl_nextlhdr_gro:
+         }
+ #if defined(MXL_OPT)
+ next_hdr_check:
+-        udpSegLen = (unsigned int) ntohs(lHdr->udpPayload);
++        udpSegLen = sizeof(struct loadHdr);
+         if (udpSegLen < udpPayloadRem) {
+             // We have received UDP_GRO segment with multiple lHdr,
+             // so iterate to next lHdr.
