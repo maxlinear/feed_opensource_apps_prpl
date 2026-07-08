@@ -1,0 +1,177 @@
+diff -Naur -x '*.json' -x '*.pdf' -x '*.md' -x '*.keys' -x tests a/udpst_common.h b/udpst_common.h
+--- a/udpst_common.h	2026-04-20 22:06:44.513232965 -0700
++++ b/udpst_common.h	2026-04-21 10:00:00.000000000 -0700
+@@ -129,5 +129,6 @@
+ //----------------------------------------------------------------------------
+ 
+ extern int is_loopback_ip(const char *ip_str);
+ extern int iface_lacks_udp_gso(int fd);
++extern int is_ipsec_route(int fd);
+ #endif /* UDPST_COMMON_H */
+diff -Naur -x '*.json' -x '*.pdf' -x '*.md' -x '*.keys' -x tests a/udpst_control.c b/udpst_control.c
+--- a/udpst_control.c	2026-04-20 22:06:44.513232965 -0700
++++ b/udpst_control.c	2026-04-21 10:00:00.000000000 -0700
+@@ -87,6 +87,9 @@
+ #include <ifaddrs.h>
+ #include <sys/ioctl.h>
+ #include <linux/ethtool.h>
++#include <linux/netlink.h>
++#include <linux/rtnetlink.h>
++#include <linux/xfrm.h>
+ #include <linux/sockios.h>
+ #include <arpa/inet.h>
+ #include <sys/epoll.h>
+@@ -289,6 +292,111 @@
+     close(tmpfd);
+     return ret;
+ }
++//
++// Detect if socket route goes through IPsec/XFRM (GSO incompatible)
++//
++#define XFRM_RECV_BUFSZ 16384
++int is_ipsec_route(int fd) {
++    struct sockaddr_storage peer;
++    socklen_t peerlen = sizeof(peer);
++    struct sockaddr_nl nla;
++    int nlfd, ret = 0, done = 0;
++    char *buf = NULL;
++    struct nlmsghdr req;
++    struct timeval tv;
++
++    if (getpeername(fd, (struct sockaddr *)&peer, &peerlen) < 0)
++        return 0;
++
++    buf = (char *)malloc(XFRM_RECV_BUFSZ);
++    if (!buf)
++        return 0;
++
++    nlfd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_XFRM);
++    if (nlfd < 0) {
++        free(buf);
++        return 0;
++    }
++
++    memset(&nla, 0, sizeof(nla));
++    nla.nl_family = AF_NETLINK;
++    if (bind(nlfd, (struct sockaddr *)&nla, sizeof(nla)) < 0) {
++        close(nlfd);
++        free(buf);
++        return 0;
++    }
++
++    tv.tv_sec = 1;
++    tv.tv_usec = 0;
++    setsockopt(nlfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++
++    memset(&req, 0, sizeof(req));
++    req.nlmsg_len = NLMSG_LENGTH(0);
++    req.nlmsg_type = XFRM_MSG_GETPOLICY;
++    req.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
++    req.nlmsg_seq = 1;
++    if (send(nlfd, &req, sizeof(req), 0) < 0) {
++        close(nlfd);
++        free(buf);
++        return 0;
++    }
++
++    while (!done) {
++        int len = recv(nlfd, buf, XFRM_RECV_BUFSZ, 0);
++        if (len <= 0)
++            break;
++        struct nlmsghdr *nlh;
++        for (nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, (unsigned int)len);
++             nlh = NLMSG_NEXT(nlh, len)) {
++            struct xfrm_userpolicy_info *pol;
++            struct rtattr *attr;
++            int attr_len, has_tmpl;
++            if (nlh->nlmsg_type == NLMSG_DONE || nlh->nlmsg_type == NLMSG_ERROR) {
++                done = 1;
++                break;
++            }
++            if (nlh->nlmsg_type != XFRM_MSG_NEWPOLICY)
++                continue;
++            pol = NLMSG_DATA(nlh);
++            if (pol->dir != XFRM_POLICY_OUT)
++                continue;
++            /* Skip bypass policies (no XFRM transforms) */
++            has_tmpl = 0;
++            attr_len = nlh->nlmsg_len - NLMSG_LENGTH(sizeof(*pol));
++            attr = (struct rtattr *)((char *)pol + NLMSG_ALIGN(sizeof(*pol)));
++            for (; RTA_OK(attr, attr_len); attr = RTA_NEXT(attr, attr_len)) {
++                if (attr->rta_type == XFRMA_TMPL) {
++                    has_tmpl = 1;
++                    break;
++                }
++            }
++            if (!has_tmpl)
++                continue;
++            /* Check if peer destination matches policy selector */
++            if (peer.ss_family == AF_INET && pol->sel.family == AF_INET) {
++                struct sockaddr_in *p = (struct sockaddr_in *)&peer;
++                uint32_t mask = pol->sel.prefixlen_d ?
++                    htonl(~0U << (32 - pol->sel.prefixlen_d)) : 0;
++                if ((p->sin_addr.s_addr & mask) == (pol->sel.daddr.a4 & mask)) {
++                    ret = 1; done = 1; break;
++                }
++            } else if (peer.ss_family == AF_INET6 && pol->sel.family == AF_INET6) {
++                struct sockaddr_in6 *p = (struct sockaddr_in6 *)&peer;
++                int pfx = pol->sel.prefixlen_d, i, match = 1;
++                for (i = 0; i < 16 && pfx > 0; i++, pfx -= 8) {
++                    uint8_t m = pfx >= 8 ? 0xff : (uint8_t)(0xff << (8 - pfx));
++                    if ((p->sin6_addr.s6_addr[i] & m) != (pol->sel.daddr.a6[i] & m)) {
++                        match = 0; break;
++                    }
++                }
++                if (match) { ret = 1; done = 1; break; }
++            }
++        }
++    }
++    close(nlfd);
++    free(buf);
++    return ret;
++}
+ 
+ //----------------------------------------------------------------------------
+ // Function definitions
+@@ -1178,13 +1286,14 @@
+         tspecplus(&repo.systemClock, &tspecvar, &c->timer3Thresh);
+         c->timer3Action = &stop_test;
+ 
+-        c->noGSO = (BOOL) iface_lacks_udp_gso(c->fd);
+-        if (c->noGSO && conf.verbose) {
+-                var = sprintf(scratch, "[%d]GSO disabled: interface lacks tx-udp-segmentation support\n",
+-                              connindex);
+-                send_proc(monConn, scratch, var);
+-        }
++        c->noGSO = (BOOL) (iface_lacks_udp_gso(c->fd) || is_ipsec_route(c->fd));
++        if (c->noGSO && conf.verbose) {
++                var = sprintf(scratch, "[%d]GSO disabled:%s%s\n", connindex,
++                              iface_lacks_udp_gso(c->fd) ? " interface lacks tx-udp-segmentation" : "",
++                              is_ipsec_route(c->fd) ? " route uses IPsec/XFRM" : "");
++                send_proc(monConn, scratch, var);
++        }
+ 
+         if (is_mxl_opt_enabled()) {
+                 int val2 = 1;
+                 int opt_name = OB_UDPST;
+@@ -1519,13 +1627,14 @@
+         tspecplus(&repo.systemClock, &tspecvar, &c->timer3Thresh);
+         c->timer3Action = &stop_test;
+ 
+-        c->noGSO = (BOOL) iface_lacks_udp_gso(c->fd);
+-        if (c->noGSO && conf.verbose) {
+-                var = sprintf(scratch, "[%d]GSO disabled: interface lacks tx-udp-segmentation support\n",
+-                              connindex);
+-                send_proc(monConn, scratch, var);
+-        }
++        c->noGSO = (BOOL) (iface_lacks_udp_gso(c->fd) || is_ipsec_route(c->fd));
++        if (c->noGSO && conf.verbose) {
++                var = sprintf(scratch, "[%d]GSO disabled:%s%s\n", connindex,
++                              iface_lacks_udp_gso(c->fd) ? " interface lacks tx-udp-segmentation" : "",
++                              is_ipsec_route(c->fd) ? " route uses IPsec/XFRM" : "");
++                send_proc(monConn, scratch, var);
++        }
+ 
+         if (is_mxl_opt_enabled()) {
+                 if (is_loopback_ip(c->remAddr))
+                         return 0;

@@ -1,0 +1,241 @@
+diff -Naur -x '*.json' -x '*.pdf' -x '*.md' -x '*.keys' -x tests a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2026-04-20 21:49:59.844302001 -0700
++++ b/CMakeLists.txt	2026-04-20 22:06:44.513232965 -0700
+@@ -34,7 +34,7 @@
+ set(CMAKE_INCLUDE_CURRENT_DIR ON)
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ set(SOFTWARE_VER "8.2.0")
+-set(MXL_RV_VER "2.4")
++set(MXL_RV_VER "2.5")
+ 
+ INCLUDE (CheckIncludeFiles)
+ INCLUDE (CheckFunctionExists)
+diff -Naur -x '*.json' -x '*.pdf' -x '*.md' -x '*.keys' -x tests a/udpst_common.h b/udpst_common.h
+--- a/udpst_common.h	2026-04-20 21:49:59.844302001 -0700
++++ b/udpst_common.h	2026-04-20 22:06:44.513232965 -0700
+@@ -129,4 +129,5 @@
+ //----------------------------------------------------------------------------
+ 
+ extern int is_loopback_ip(const char *ip_str);
++extern int iface_lacks_udp_gso(int fd);
+ #endif /* UDPST_COMMON_H */
+diff -Naur -x '*.json' -x '*.pdf' -x '*.md' -x '*.keys' -x tests a/udpst_control.c b/udpst_control.c
+--- a/udpst_control.c	2026-04-20 21:49:59.848302001 -0700
++++ b/udpst_control.c	2026-04-20 22:06:44.513232965 -0700
+@@ -84,6 +84,10 @@
+ #include <time.h>
+ #include <netdb.h>
+ #include <net/if.h>
++#include <ifaddrs.h>
++#include <sys/ioctl.h>
++#include <linux/ethtool.h>
++#include <linux/sockios.h>
+ #include <arpa/inet.h>
+ #include <sys/epoll.h>
+ #include <sys/file.h>
+@@ -178,6 +182,131 @@
+ 
+     return 0;
+ }
++//
++// Check if socket outgoing interface lacks UDP GSO (NETIF_F_GSO_UDP_L4)
++// Queries ethtool features via SIOCETHTOOL ioctl (no ethtool binary needed)
++// Returns 1 if GSO should be skipped, 0 if GSO is available
++//
++int iface_lacks_udp_gso(int fd) {
++    struct sockaddr_storage addr;
++    socklen_t addrlen = sizeof(addr);
++    char ifname[IF_NAMESIZE] = {0};
++    struct ifaddrs *ifap, *ifa;
++    struct ifreq ifr;
++    int tmpfd, ret = 1;
++    uint32_t n_features, i, feat_idx;
++    struct ethtool_gstrings *strs;
++    struct ethtool_gfeatures *gfeat;
++    uint32_t n_blocks, block, bit;
++    size_t sz;
++
++    // Resolve socket to outgoing interface name
++    if (getsockname(fd, (struct sockaddr *)&addr, &addrlen) < 0)
++        return 0;
++
++    if (getifaddrs(&ifap) < 0)
++        return 0;
++
++    for (ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
++        if (ifa->ifa_addr == NULL)
++            continue;
++        if (ifa->ifa_addr->sa_family != addr.ss_family)
++            continue;
++        if (addr.ss_family == AF_INET) {
++            struct sockaddr_in *a = (struct sockaddr_in *)&addr;
++            struct sockaddr_in *b = (struct sockaddr_in *)ifa->ifa_addr;
++            if (a->sin_addr.s_addr == b->sin_addr.s_addr) {
++                strncpy(ifname, ifa->ifa_name, IF_NAMESIZE - 1);
++                break;
++            }
++        } else if (addr.ss_family == AF_INET6) {
++            struct sockaddr_in6 *a = (struct sockaddr_in6 *)&addr;
++            struct sockaddr_in6 *b = (struct sockaddr_in6 *)ifa->ifa_addr;
++            if (memcmp(&a->sin6_addr, &b->sin6_addr, sizeof(struct in6_addr)) == 0) {
++                strncpy(ifname, ifa->ifa_name, IF_NAMESIZE - 1);
++                break;
++            }
++        }
++    }
++    freeifaddrs(ifap);
++
++    if (ifname[0] == '\0')
++        return 0;
++
++    tmpfd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (tmpfd < 0)
++        return 0;
++
++    // Query feature string set count
++    struct {
++        struct ethtool_sset_info hdr;
++        uint32_t data[1];
++    } sset_info;
++    memset(&sset_info, 0, sizeof(sset_info));
++    sset_info.hdr.cmd = ETHTOOL_GSSET_INFO;
++    sset_info.hdr.sset_mask = 1ULL << ETH_SS_FEATURES;
++
++    memset(&ifr, 0, sizeof(ifr));
++    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
++    ifr.ifr_data = (void *)&sset_info;
++    if (ioctl(tmpfd, SIOCETHTOOL, &ifr) < 0) {
++        close(tmpfd);
++        return 0;
++    }
++    n_features = sset_info.data[0];
++    if (n_features == 0) {
++        close(tmpfd);
++        return 0;
++    }
++
++    // Get feature name strings, find "tx-udp-segmentation"
++    sz = sizeof(struct ethtool_gstrings) + n_features * ETH_GSTRING_LEN;
++    strs = (struct ethtool_gstrings *)calloc(1, sz);
++    if (!strs) { close(tmpfd); return 0; }
++    strs->cmd = ETHTOOL_GSTRINGS;
++    strs->string_set = ETH_SS_FEATURES;
++    strs->len = n_features;
++    memset(&ifr, 0, sizeof(ifr));
++    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
++    ifr.ifr_data = (void *)strs;
++    if (ioctl(tmpfd, SIOCETHTOOL, &ifr) < 0) {
++        free(strs); close(tmpfd); return 0;
++    }
++    feat_idx = UINT32_MAX;
++    for (i = 0; i < n_features; i++) {
++        if (strcmp((char *)&strs->data[i * ETH_GSTRING_LEN],
++                   "tx-udp-segmentation") == 0) {
++            feat_idx = i;
++            break;
++        }
++    }
++    free(strs);
++    if (feat_idx == UINT32_MAX) {
++        close(tmpfd);
++        return 1; // feature not found, no UDP GSO
++    }
++
++    // Check if the feature is active
++    n_blocks = (n_features + 31) / 32;
++    sz = sizeof(struct ethtool_gfeatures) +
++         n_blocks * sizeof(struct ethtool_get_features_block);
++    gfeat = (struct ethtool_gfeatures *)calloc(1, sz);
++    if (!gfeat) { close(tmpfd); return 0; }
++    gfeat->cmd = ETHTOOL_GFEATURES;
++    gfeat->size = n_blocks;
++    memset(&ifr, 0, sizeof(ifr));
++    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
++    ifr.ifr_data = (void *)gfeat;
++    if (ioctl(tmpfd, SIOCETHTOOL, &ifr) < 0) {
++        free(gfeat); close(tmpfd); return 0;
++    }
++    block = feat_idx / 32;
++    bit = feat_idx % 32;
++    ret = !(gfeat->features[block].active & (1U << bit));
++    free(gfeat);
++    close(tmpfd);
++    return ret;
++}
+ 
+ //----------------------------------------------------------------------------
+ // Function definitions
+@@ -1067,6 +1178,13 @@
+         tspecplus(&repo.systemClock, &tspecvar, &c->timer3Thresh);
+         c->timer3Action = &stop_test;
+ 
++        c->noGSO = (BOOL) iface_lacks_udp_gso(c->fd);
++        if (c->noGSO && conf.verbose) {
++                var = sprintf(scratch, "[%d]GSO disabled: interface lacks tx-udp-segmentation support\n",
++                              connindex);
++                send_proc(monConn, scratch, var);
++        }
++
+         if (is_mxl_opt_enabled()) {
+                 int val2 = 1;
+                 int opt_name = OB_UDPST;
+@@ -1406,6 +1519,13 @@
+         tspecplus(&repo.systemClock, &tspecvar, &c->timer3Thresh);
+         c->timer3Action = &stop_test;
+ 
++        c->noGSO = (BOOL) iface_lacks_udp_gso(c->fd);
++        if (c->noGSO && conf.verbose) {
++                var = sprintf(scratch, "[%d]GSO disabled: interface lacks tx-udp-segmentation support\n",
++                              connindex);
++                send_proc(monConn, scratch, var);
++        }
++
+         if (is_mxl_opt_enabled()) {
+                 if (is_loopback_ip(c->remAddr))
+                         return 0;
+diff -Naur -x '*.json' -x '*.pdf' -x '*.md' -x '*.keys' -x tests a/udpst_data.c b/udpst_data.c
+--- a/udpst_data.c	2026-04-20 21:49:59.853302001 -0700
++++ b/udpst_data.c	2026-04-20 22:06:44.515232965 -0700
+@@ -516,7 +516,7 @@
+                 }
+         }
+ }
+-#else
++#endif // HAVE_GSO
+ 
+ //
+ // Send a burst of messages using the Linux 3.0+ only sendmmsg syscall
+@@ -597,7 +597,6 @@
+                 }
+         }
+ }
+-#endif // HAVE_GSO
+ #else
+ 
+ //
+@@ -841,10 +840,11 @@
+ 
+ #if defined(HAVE_SENDMMSG)
+ #if defined(HAVE_GSO)
+-        _sendmmsg_gso(connindex, totalburst, burstsize, payload, addon);
+-#else
+-        _sendmmsg_burst(connindex, totalburst, burstsize, payload, addon);
++        if (!conn[connindex].noGSO)
++                _sendmmsg_gso(connindex, totalburst, burstsize, payload, addon);
++        else
+ #endif // HAVE_GSO
++                _sendmmsg_burst(connindex, totalburst, burstsize, payload, addon);
+ #else
+         _sendmsg_burst(connindex, totalburst, burstsize, payload, addon);
+ #endif // HAVE_SENDMMSG
+diff -Naur -x '*.json' -x '*.pdf' -x '*.md' -x '*.keys' -x tests a/udpst.h b/udpst.h
+--- a/udpst.h	2026-04-20 21:49:59.849302001 -0700
++++ b/udpst.h	2026-04-20 22:06:44.513232965 -0700
+@@ -396,6 +396,7 @@
+         BOOL dataReady;                  // Data ready indicator
+         int serverIndex;                 // Index of server ID
+         int ipProtocol;                  // IPPROTO_IP or IPPROTO_IPV6
++        BOOL noGSO;                      // GSO incompatible (PPP/IPsec/etc.)
+         int ipTosByte;                   // IP ToS byte for testing
+         char locAddr[INET6_ADDR_STRLEN]; // Local IP address as string
+         int locPort;                     // Local port
